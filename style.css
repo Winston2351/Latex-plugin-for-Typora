@@ -1,0 +1,119 @@
+/* LaTeX 数学输入法 —— 候选弹窗与 ghost */
+
+#math-input-popup {
+  position: fixed;
+  z-index: 99999;
+  top: -9999px;
+  left: 0;
+  min-width: 230px;
+  max-width: 520px;
+  max-height: 264px;
+  overflow-y: auto;
+  margin: 0;
+  padding: 4px;
+  box-sizing: border-box;
+  border-radius: 8px;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  background: #ffffff;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.18);
+  font-size: 13px;
+  line-height: 1.5;
+  opacity: 0;
+  visibility: hidden;
+  transform: translateY(-2px);
+  transition: opacity 0.08s ease, transform 0.08s ease, visibility 0s linear 0.08s;
+}
+
+#math-input-popup.mi-show {
+  opacity: 1;
+  visibility: visible;
+  transform: translateY(0);
+  transition: opacity 0.08s ease, transform 0.08s ease;
+}
+
+#math-input-popup ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+#math-input-popup li {
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+  padding: 3px 10px;
+  border-radius: 5px;
+  cursor: pointer;
+  white-space: nowrap;
+  color: #2b2f36;
+}
+
+#math-input-popup li.active {
+  background: #d7e8ff;
+  color: #111827;
+}
+
+#math-input-popup .mi-code {
+  font-family: Consolas, "Cascadia Mono", "JetBrains Mono", Menlo, Monaco, monospace;
+  font-size: 12.5px;
+}
+
+#math-input-popup .mi-zh {
+  margin-left: auto;
+  color: #8a8f99;
+  font-size: 12px;
+}
+
+#math-input-popup li.active .mi-zh {
+  color: #4b5563;
+}
+
+/* 深色（暗色 Typora 主题自动适配） */
+#math-input-popup.mi-dark {
+  background: #2b2d30;
+  border-color: rgba(255, 255, 255, 0.12);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5);
+}
+
+#math-input-popup.mi-dark li {
+  color: #d8dee4;
+}
+
+#math-input-popup.mi-dark li.active {
+  background: #2f4b73;
+  color: #f3f6fa;
+}
+
+#math-input-popup.mi-dark .mi-zh {
+  color: #8b929d;
+}
+
+#math-input-popup.mi-dark li.active .mi-zh {
+  color: #aeb6c2;
+}
+
+/* 滚动条 */
+#math-input-popup::-webkit-scrollbar {
+  width: 8px;
+}
+#math-input-popup::-webkit-scrollbar-thumb {
+  background: rgba(128, 128, 128, 0.45);
+  border-radius: 4px;
+}
+
+/* ghost 内联浅灰补全（不进入文本流、不响应鼠标） */
+#math-input-ghost {
+  position: fixed;
+  z-index: 99998;
+  top: -9999px;
+  left: 0;
+  pointer-events: none;
+  white-space: pre;
+  opacity: 0.42;
+  visibility: hidden;
+  line-height: 1;
+}
+
+#math-input-ghost.mi-show {
+  visibility: visible;
+}
