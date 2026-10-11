@@ -68,6 +68,18 @@
   color: #4b5563;
 }
 
+/* 右下角页码（总候选页数） */
+#math-input-popup .mi-page {
+  text-align: right;
+  color: #9aa0a8;
+  font-size: 11px;
+  line-height: 1.4;
+  padding: 3px 8px 1px;
+  margin-top: 2px;
+  border-top: 1px solid rgba(0, 0, 0, 0.06);
+  user-select: none;
+}
+
 /* 深色（暗色 Typora 主题自动适配） */
 #math-input-popup.mi-dark {
   background: #2b2d30;
@@ -90,6 +102,11 @@
 
 #math-input-popup.mi-dark li.active .mi-zh {
   color: #aeb6c2;
+}
+
+#math-input-popup.mi-dark .mi-page {
+  color: #6b7280;
+  border-top-color: rgba(255, 255, 255, 0.08);
 }
 
 /* 滚动条 */

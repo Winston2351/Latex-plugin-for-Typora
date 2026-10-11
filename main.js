@@ -412,6 +412,8 @@ function expandSnippet(insert) {
 
 // ───────────────────────── 弹窗 / Ghost UI ─────────────────────────
 
+const PAGE_SIZE = 5 // 候选弹窗每页条数
+
 class CompletionUI {
   constructor() {
     this.popup = null
@@ -428,7 +430,7 @@ class CompletionUI {
     const el = document.createElement('div')
     el.id = 'math-input-popup'
     el.className = 'math-input-theme-auto'
-    el.innerHTML = '<ul></ul>'
+    el.innerHTML = '<ul></ul><div class="mi-page"></div>'
     el.addEventListener('mousedown', e => e.preventDefault()) // 保住编辑器焦点
     el.addEventListener('click', e => {
       const li = e.target.closest('li')
@@ -453,18 +455,24 @@ class CompletionUI {
     this.ghost = el
   }
 
+  get page() { return Math.floor(this.idx / PAGE_SIZE) }
+  get totalPages() { return Math.max(1, Math.ceil(this.items.length / PAGE_SIZE)) }
+
   _renderActive() {
-    this.popup.querySelectorAll('li').forEach((li, i) => li.classList.toggle('active', i === this.idx))
+    const start = this.page * PAGE_SIZE
+    this.popup.querySelectorAll('li').forEach((li, i) => li.classList.toggle('active', start + i === this.idx))
     const cur = this.popup.querySelector('li.active')
     if (cur) cur.scrollIntoView({ block: 'nearest' })
   }
 
-  _renderList() {
+  /** 渲染当前页（每页 PAGE_SIZE 条）+ 右下角页码 */
+  _renderPage() {
     const ul = this.popup.querySelector('ul')
     ul.innerHTML = ''
-    this.items.forEach((c, i) => {
+    const start = this.page * PAGE_SIZE
+    this.items.slice(start, start + PAGE_SIZE).forEach((c, i) => {
       const li = document.createElement('li')
-      li.dataset.idx = i
+      li.dataset.idx = start + i
       const left = document.createElement('span')
       left.className = 'mi-code'
       left.textContent = c.insert.replace(new RegExp(SLOT, 'g'), '')
@@ -474,6 +482,8 @@ class CompletionUI {
       li.append(left, right)
       ul.appendChild(li)
     })
+    this.popup.querySelector('.mi-page').textContent =
+      this.totalPages > 1 ? `${this.page + 1}/${this.totalPages} 页` : ''
     this._renderActive()
   }
 
@@ -517,7 +527,7 @@ class CompletionUI {
     if (state.mode === 'popup' && this.items.length) {
       this.mode = 'popup'
       this._ensurePopup()
-      this._renderList()
+      this._renderPage()
       this._applyThemeFrom(state.themeRef || document.body)
       this.popup.style.left = state.x + 'px'
       this.popup.style.top = state.y + 'px'
@@ -564,8 +574,26 @@ class CompletionUI {
     }
   }
 
-  next() { if (!this.popup) return; this.idx = (this.idx + 1) % this.items.length; this._renderActive(); this.syncGhost() }
-  prev() { if (!this.popup) return; this.idx = (this.idx - 1 + this.items.length) % this.items.length; this._renderActive(); this.syncGhost() }
+  _moveTo(newIdx) {
+    const oldPage = this.page
+    this.idx = ((newIdx % this.items.length) + this.items.length) % this.items.length
+    if (this.page !== oldPage) this._renderPage()
+    else this._renderActive()
+    this.syncGhost()
+  }
+
+  next() { if (!this.popup) return; this._moveTo(this.idx + 1) }
+  prev() { if (!this.popup) return; this._moveTo(this.idx - 1) }
+  nextPage() {
+    if (!this.popup) return
+    this.idx = ((this.page + 1) % this.totalPages) * PAGE_SIZE
+    this._renderPage(); this.syncGhost()
+  }
+  prevPage() {
+    if (!this.popup) return
+    this.idx = ((this.page - 1 + this.totalPages) % this.totalPages) * PAGE_SIZE
+    this._renderPage(); this.syncGhost()
+  }
   current() { return this.items[this.idx] }
 
   /** 传 owner 时仅关闭属于该 owner 的 UI；不传则无条件关闭 */
@@ -633,10 +661,12 @@ class BlockMathController {
   refresh() {
     const cm = this.cm
     const cur = cm.getCursor()
-    // 槽位模式：光标在 snippet 内时不响应查询；离开则自动退出槽模式
+    // 槽位模式：仅当光标位于某个槽位内部时保持守卫；否则退出并继续解析查询
+    // （修复：一个 $$ 中多个公式时，Enter 换行后旧槽位状态吞掉新查询）
     if (this.slots) {
       const idx = cm.indexFromPos(cur)
-      if (idx >= this.baseIdx && idx <= this.snippetEnd) return
+      const inside = this.slots.some(([s, e]) => idx >= this.baseIdx + s && idx <= this.baseIdx + e)
+      if (inside) return
       this.slots = null
       this.slotIdx = -1
     }
@@ -690,9 +720,13 @@ class BlockMathController {
 
     if (mode === 'popup') {
       switch (e.key) {
-        case 'ArrowRight': case 'ArrowDown':
+        case 'ArrowRight':
+          e.preventDefault(); e.stopPropagation(); this.ui.nextPage(); return
+        case 'ArrowDown':
           e.preventDefault(); e.stopPropagation(); this.ui.next(); return
-        case 'ArrowLeft': case 'ArrowUp':
+        case 'ArrowLeft':
+          e.preventDefault(); e.stopPropagation(); this.ui.prevPage(); return
+        case 'ArrowUp':
           e.preventDefault(); e.stopPropagation(); this.ui.prev(); return
         case ' ': case 'Tab':
           e.preventDefault(); e.stopPropagation(); this._apply(this.ui.current()); return
@@ -738,21 +772,33 @@ class BlockMathController {
     this.active = false
   }
 
-  /** 槽位内容被编辑时，平移后续槽索引 */
+  /** 槽位内容被编辑时，平移/缩放槽索引；结构性编辑（换行等）退出槽模式 */
   _trackSlots(chg) {
     if (!this.slots || chg.origin === '+complete') return
     const cm = this.cm
     const a = cm.indexFromPos(chg.from)
     const b = cm.indexFromPos(chg.to)
-    const n = chg.text.join('\n').length
-    const delta = n - (b - a)
+    const ins = chg.text.join('\n')
+    if (ins.includes('\n')) { // 换行：槽位概念失效（用户另起新公式）
+      this.slots = null
+      this.slotIdx = -1
+      return
+    }
+    const delta = ins.length - (b - a)
     if (delta === 0) return
     let valid = true
     this.slots = this.slots.map(([s, e]) => {
-      if (e <= a) return [s, e]
-      if (s >= b) return [s + delta, e + delta]
-      valid = false
-      return [s, e] // 变化横跨槽位，丢弃模式
+      if (a === b) { // 纯插入
+        if (a < s) return [s + delta, e + delta]
+        if (a > e) return [s, e]
+        return [s, e + delta] // 插在槽内（含两端边界）：槽增长
+      }
+      // 删除 / 替换（b > a）
+      if (b <= s) return [s + delta, e + delta]
+      if (a >= e) return [s, e]
+      if (a >= s && b <= e) return [s, e + delta] // 槽内删除：槽缩短
+      valid = false // 跨槽变化：丢弃模式
+      return [s, e]
     })
     this.snippetEnd += delta
     if (!valid || this.snippetEnd < this.baseIdx) this.slots = null
@@ -888,9 +934,13 @@ class InlineMathController {
     const mode = this.ui.mode
     if (mode === 'popup') {
       switch (e.key) {
-        case 'ArrowRight': case 'ArrowDown':
+        case 'ArrowRight':
+          e.preventDefault(); e.stopPropagation(); this.ui.nextPage(); return
+        case 'ArrowDown':
           e.preventDefault(); e.stopPropagation(); this.ui.next(); return
-        case 'ArrowLeft': case 'ArrowUp':
+        case 'ArrowLeft':
+          e.preventDefault(); e.stopPropagation(); this.ui.prevPage(); return
+        case 'ArrowUp':
           e.preventDefault(); e.stopPropagation(); this.ui.prev(); return
         case ' ': case 'Tab':
           e.preventDefault(); e.stopPropagation(); this._apply(this.ui.current()); return
