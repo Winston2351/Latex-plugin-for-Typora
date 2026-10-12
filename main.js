@@ -418,11 +418,27 @@ class CompletionUI {
   constructor() {
     this.popup = null
     this.ghost = null
+    this.ghostBm = null   // CM 书签挂件（块公式 ghost，真实占位）
+    this.ghostCm = null   // 挂件所属 CM（clear 后用于 refresh 重算）
     this.items = []
     this.idx = 0
     this.onSelect = null
     this.mode = null // 'popup' | 'ghost'
     this.owner = null
+  }
+
+  _clearGhostSpace() {
+    if (!this.ghostBm) return
+    const cm = this.ghostCm
+    try { this.ghostBm.clear() } catch (e) { /* CM 已销毁 */ }
+    this.ghostBm = null
+    this.ghostCm = null
+    // 只通过 CodeMirror 自身的生命周期移除挂件并重新测量。
+    // 切勿手动 remove 挂件 DOM——那会绕过 CM 的行测量(measure)，
+    // 造成视图节点与内部缓存脱节，setSelection 的光标会画到错误位置。
+    if (cm) {
+      setTimeout(() => { try { cm.refresh() } catch (e) { /* 已销毁 */ } }, 0)
+    }
   }
 
   _ensurePopup() {
@@ -542,6 +558,24 @@ class CompletionUI {
   }
 
   _applyGhost(text, st) {
+    this._clearGhostSpace()
+    if (!text) {
+      if (this.ghost) { this.ghost.classList.remove('mi-show'); this.ghost.textContent = '' }
+      return
+    }
+    if (st.cm) {
+      // 块公式：ghost 作为 CM 书签挂件插入光标处——处于文本流中真实占位，
+      // 后续文字（含灰色 $）被正常推开，不再重叠
+      const el = document.createElement('span')
+      el.className = 'mi-ghost-widget'
+      el.textContent = text
+      try {
+        this.ghostBm = st.cm.setBookmark(st.cm.getCursor(), { widget: el })
+        this.ghostCm = st.cm
+      } catch (e) { /* 忽略 */ }
+      return
+    }
+    // 行内公式：不能向 script 源码插 DOM（会污染公式），用不透明悬浮 chip
     this._ensureGhost()
     const f = st.font || {}
     this.ghost.style.fontFamily = f.family || 'inherit'
@@ -552,7 +586,7 @@ class CompletionUI {
     this.ghost.style.top = (st.ghostY != null ? st.ghostY : st.y) + 'px'
     this.ghost.style.height = (st.height || 20) + 'px'
     this.ghost.textContent = text
-    this.ghost.classList.toggle('mi-show', !!text)
+    this.ghost.classList.add('mi-show')
   }
 
   /** 弹窗中切换候选项时，ghost 跟随当前项更新 */
@@ -560,8 +594,7 @@ class CompletionUI {
     const st = this._state
     if (!st || st.mode !== 'popup' || st.query === '') return
     const g = ghostSuffix(this.current(), st.query)
-    if (g) this._applyGhost(g, st)
-    else if (this.ghost) { this.ghost.classList.remove('mi-show'); this.ghost.textContent = '' }
+    this._applyGhost(g, st)
   }
 
   _flipIfNeeded(state) {
@@ -601,10 +634,12 @@ class CompletionUI {
     if (owner && this.owner && owner !== this.owner) return
     if (this.popup) { this.popup.classList.remove('mi-show'); this.popup.style.top = '-9999px' }
     if (this.ghost) { this.ghost.classList.remove('mi-show'); this.ghost.textContent = '' }
+    this._clearGhostSpace()
     this.mode = null
   }
 
   destroy() {
+    this._clearGhostSpace()
     this.popup && this.popup.remove()
     this.ghost && this.ghost.remove()
     this.popup = this.ghost = null
@@ -622,18 +657,36 @@ class BlockMathController {
     this.slotIdx = -1
     this.baseIdx = 0
     this.snippetEnd = 0
+    this.suppressEnd = null // 无槽位命令刚补全的位置：光标未离开前不再弹窗
 
     this.onInputRead = () => this.refresh()
     this.onCursor = () => { this.refresh() }
     this.onChange = (cmArg, chg) => this._trackSlots(chg)
     this.onKeyDown = (inst, e) => this._handleKey(e)
-    this.onBlur = () => this._close()
+    // 方向键触达行边界时 Typora 会把焦点移出 textarea 触发 blur；
+    // UI 活跃（弹窗/ghost 显示）时忽略 blur，避免误关。
+    // 真正离开编辑器时由文档级 mousedown 兜底关闭。
+    this.onBlur = () => {
+      if (this.active) return
+      this._close()
+    }
 
     cm.on('inputRead', this.onInputRead)
     cm.on('cursorActivity', this.onCursor)
     cm.on('change', this.onChange)
     cm.on('keydown', this.onKeyDown)
     cm.on('blur', this.onBlur)
+
+    // 点击编辑器/弹窗外部时关闭（兜底，因为 onBlur 在 UI 活跃时被忽略）
+    this.onDocMouseDown = (e) => {
+      if (!this.active) return
+      const wrapper = cm.getWrapperElement()
+      const popup = this.ui.popup
+      if (wrapper.contains(e.target)) return
+      if (popup && popup.contains(e.target)) return
+      this._close()
+    }
+    document.addEventListener('mousedown', this.onDocMouseDown, true)
   }
 
   destroy() {
@@ -643,6 +696,7 @@ class BlockMathController {
     cm.off('change', this.onChange)
     cm.off('keydown', this.onKeyDown)
     cm.off('blur', this.onBlur)
+    document.removeEventListener('mousedown', this.onDocMouseDown, true)
     this._close()
   }
 
@@ -651,6 +705,7 @@ class BlockMathController {
     this.active = false
     this.slots = null
     this.slotIdx = -1
+    this.suppressEnd = null
   }
 
   _font() {
@@ -661,19 +716,42 @@ class BlockMathController {
   refresh() {
     const cm = this.cm
     const cur = cm.getCursor()
-    // 槽位模式：仅当光标位于某个槽位内部时保持守卫；否则退出并继续解析查询
-    // （修复：一个 $$ 中多个公式时，Enter 换行后旧槽位状态吞掉新查询）
-    if (this.slots) {
-      const idx = cm.indexFromPos(cur)
-      const inside = this.slots.some(([s, e]) => idx >= this.baseIdx + s && idx <= this.baseIdx + e)
-      if (inside) return
-      this.slots = null
-      this.slotIdx = -1
-    }
     const lineBefore = cm.getLine(cur.line).slice(0, cur.ch)
     const parsed = parseQuery(lineBefore)
 
+    // 槽位模式：查询起点决定去留。查询永远优先于槽位（Tab 应用候选而非跳槽）。
+    if (this.slots) {
+      if (parsed) {
+        const qStart = cm.indexFromPos({ line: cur.line, ch: parsed.startCh })
+        const inSlot = this.slots.some(([s, e]) => qStart >= this.baseIdx + s && qStart <= this.baseIdx + e)
+        if (!inSlot) {
+          // 查询起点在所有槽位之外 → 用户新起一个公式，退出槽位模式
+          this.slots = null
+          this.slotIdx = -1
+        }
+        // 查询起点在槽内：保持外层槽位，同时照常弹候选（支持嵌套补全）
+      } else {
+        const idx = cm.indexFromPos(cur)
+        if (this.slots.some(([s, e]) => idx >= this.baseIdx + s && idx <= this.baseIdx + e)) {
+          // 槽内普通输入：保持槽位、不出 UI
+          this.ui.hide(this)
+          this.active = false
+          return
+        }
+        this.slots = null
+        this.slotIdx = -1
+      }
+    }
+
     if (!parsed) { this._close(); return }
+
+    // 刚补全的无槽位命令：光标未离开插入末尾前不再弹窗（输入已完成，
+    // 下一次键入 \ 自然形成新查询重新触发）
+    if (this.suppressEnd != null) {
+      if (cm.indexFromPos(cur) === this.suppressEnd) return
+      this.suppressEnd = null
+    }
+
     const items = matchCommands(parsed.query)
     if (!items.length) { this._close(); return }
 
@@ -684,64 +762,62 @@ class BlockMathController {
 
     const ghost = ghostSuffix(items[0], parsed.query)
     if (items.length === 1 && parsed.query !== '' && ghost) {
-      // 唯一命中且有 ghost 后缀：只出 ghost
+      // 唯一命中且有 ghost 后缀：只出 ghost（CM 书签挂件，真实占位）
       this.ui.show({
         owner: this, query: parsed.query,
         mode: 'ghost', items, idx: 0,
         x: coords.left, y: coords.top, height: coords.bottom - coords.top,
-        font, ghostText: ghost, themeRef: cm.getWrapperElement(), onSelect,
+        cm: this.cm, font, ghostText: ghost, themeRef: cm.getWrapperElement(), onSelect,
       })
     } else {
-      // 多候选或刚输入 \：弹窗；顺带显示高亮项 ghost
-      const idx = 0
-      const ghost = ghostSuffix(items[idx], parsed.query)
+      // 多候选或刚输入 \：弹窗；高亮项 ghost 同样走书签挂件
       this.ui.show({
         owner: this, query: parsed.query,
-        mode: 'popup', items, idx,
+        mode: 'popup', items, idx: 0,
         x: coords.left, y: coords.bottom + 2, height: coords.bottom - coords.top,
-        ghostX: coords.left, ghostY: coords.top,
-        font, ghostText: parsed.query === '' ? null : ghost,
+        cm: this.cm, font, ghostText: parsed.query === '' ? null : ghost,
         themeRef: cm.getWrapperElement(), onSelect,
       })
     }
   }
 
   _handleKey(e) {
-    // 槽位跳转优先（补全刚接受后）
-    if (this.slots && this.slots.length && e.key === 'Tab') {
-      e.preventDefault()
-      e.stopPropagation()
-      this._gotoSlot(e.shiftKey ? this.slotIdx - 1 : this.slotIdx + 1)
-      return
+    // 候选 UI 激活时优先处理。
+    // 左右键不拦截：交回 CodeMirror 原生移动光标，弹窗随光标处查询自动刷新/关闭。
+    if (this.active && this.ui.mode && this.ui.owner === this) {
+      const mode = this.ui.mode
+      if (mode === 'popup') {
+        switch (e.key) {
+          case 'ArrowDown':
+            e.preventDefault(); e.stopPropagation(); this.ui.next(); return true
+          case 'ArrowUp':
+            e.preventDefault(); e.stopPropagation(); this.ui.prev(); return true
+          case ' ': case 'Tab':
+            e.preventDefault(); e.stopPropagation(); this._apply(this.ui.current()); return true
+          case 'Enter':
+            this._close(); return // 放行换行
+          case 'Escape':
+            e.preventDefault(); e.stopPropagation(); this._close(); return true
+        }
+        return
+      }
+      if (mode === 'ghost') {
+        if (e.key === 'Tab') {
+          e.preventDefault(); e.stopPropagation()
+          this._apply(this.ui.current())
+          return true
+        } else if (e.key === 'Escape') {
+          e.preventDefault(); e.stopPropagation(); this._close()
+          return true
+        }
+        return
+      }
     }
-
-    if (!this.active || !this.ui.mode || this.ui.owner !== this) return
-    const mode = this.ui.mode
-
-    if (mode === 'popup') {
-      switch (e.key) {
-        case 'ArrowRight':
-          e.preventDefault(); e.stopPropagation(); this.ui.nextPage(); return
-        case 'ArrowDown':
-          e.preventDefault(); e.stopPropagation(); this.ui.next(); return
-        case 'ArrowLeft':
-          e.preventDefault(); e.stopPropagation(); this.ui.prevPage(); return
-        case 'ArrowUp':
-          e.preventDefault(); e.stopPropagation(); this.ui.prev(); return
-        case ' ': case 'Tab':
-          e.preventDefault(); e.stopPropagation(); this._apply(this.ui.current()); return
-        case 'Enter':
-          this._close(); return // 放行换行
-        case 'Escape':
-          e.preventDefault(); e.stopPropagation(); this._close(); return
-      }
-    } else if (mode === 'ghost') {
-      if (e.key === 'Tab' || e.key === 'ArrowRight') {
-        e.preventDefault(); e.stopPropagation()
-        this._apply(this.ui.current())
-      } else if (e.key === 'Escape') {
-        e.preventDefault(); e.stopPropagation(); this._close()
-      }
+    // UI 未激活：Tab 跳槽位
+    if (this.slots && this.slots.length && e.key === 'Tab') {
+      e.preventDefault(); e.stopPropagation()
+      this._gotoSlot(e.shiftKey ? this.slotIdx - 1 : this.slotIdx + 1)
+      return true
     }
   }
 
@@ -755,21 +831,51 @@ class BlockMathController {
     const from = { line: cur.line, ch: parsed.startCh }
     const { text, slots } = expandSnippet(command.insert)
     const baseIdx = cm.indexFromPos(from)
+    const qLen = cm.indexFromPos(cur) - baseIdx
+
+    // 先清 UI（含 ghost 书签），避免插入时挂件残留
+    this.ui.hide(this)
+    this.active = false
+
+    // 若本次插入发生在旧模板槽位内部且新命令无槽位，之后需平移恢复外层槽位
+    const prev = this.slots
+      ? { slots: this.slots, base: this.baseIdx, end: this.snippetEnd, slotIdx: this.slotIdx }
+      : null
 
     cm.operation(() => {
       cm.replaceRange(text, from, cur, '+complete')
       this.baseIdx = baseIdx
       this.snippetEnd = baseIdx + text.length
-      this.slots = slots.length ? slots : null
-      this.slotIdx = -1
-      if (this.slots) {
+      this.suppressEnd = null
+      if (slots.length) {
+        this.slots = slots
+        this.slotIdx = -1
         this._gotoSlot(0)
       } else {
         cm.setCursor(cm.posFromIndex(this.snippetEnd))
+        this.suppressEnd = this.snippetEnd // 输入已完成：同位置不再弹窗
+        if (prev && baseIdx >= prev.base && baseIdx <= prev.end) {
+          // 嵌套在旧模板内补全无槽位命令：平移外层槽位并保持可跳转
+          const delta = text.length - qLen
+          const a = baseIdx
+          this.slots = prev.slots.map(([s, e]) => {
+            const as = prev.base + s, ae = prev.base + e
+            if (a <= as) return [s + delta, e + delta]
+            if (a > ae) return [s, e]
+            return [s, e + delta] // 插入点在本槽内：槽增长
+          })
+          this.baseIdx = prev.base
+          this.snippetEnd = prev.end + delta
+          const rel = this.suppressEnd - this.baseIdx
+          const k = this.slots.findIndex(([s, e]) => rel >= s && rel <= e)
+          if (k >= 0) this.slotIdx = k
+          else { this.slots = null; this.slotIdx = -1 }
+        } else {
+          this.slots = null
+          this.slotIdx = -1
+        }
       }
     })
-    this.ui.hide(this)
-    this.active = false
   }
 
   /** 槽位内容被编辑时，平移/缩放槽索引；结构性编辑（换行等）退出槽模式 */
@@ -830,6 +936,7 @@ class InlineMathController {
     this.active = false
     this.scriptEl = null
     this.startOffset = -1
+    this.suppress = null // 无槽位命令刚补全：{node, offset}，光标未动前不再弹窗
 
     this.composing = false
     this.onInput = e => { if (!e.isComposing) this.refresh() }
@@ -877,6 +984,7 @@ class InlineMathController {
     this.ui.hide(this)
     this.active = false
     this.scriptEl = null
+    this.suppress = null
   }
 
   refresh() {
@@ -886,6 +994,13 @@ class InlineMathController {
 
     // 仅处理 script 直接文本节点（Typora 行内数学源码节点）
     if (node.parentElement !== script) { this._close(); return }
+
+    // 刚补全的无槽位命令：光标未动前不再弹窗（输入已完成）
+    if (this.suppress) {
+      if (node === this.suppress.node && offset === this.suppress.offset) return
+      this.suppress = null
+    }
+
     const lineBefore = node.textContent.slice(0, offset)
     const parsed = parseQuery(lineBefore)
     if (!parsed) { this._close(); return }
@@ -910,7 +1025,7 @@ class InlineMathController {
       this.ui.show({
         owner: this, query: parsed.query,
         mode: 'ghost', items, idx: 0,
-        x: rect.right, y: rect.top, height: rect.height || 20,
+        x: rect.right + 2, y: rect.top, height: rect.height || 20,
         font, ghostText: ghost, themeRef: script.parentElement,
         onSelect: item => this._apply(item),
       })
@@ -932,14 +1047,11 @@ class InlineMathController {
     if (e.target && e.target.tagName === 'TEXTAREA' && e.target.closest && e.target.closest('.CodeMirror')) return
     if (!this.active || !this.ui.mode || this.ui.owner !== this) return
     const mode = this.ui.mode
+    // 左右键不拦截：交回浏览器原生移动光标，弹窗随光标处查询自动刷新/关闭。
     if (mode === 'popup') {
       switch (e.key) {
-        case 'ArrowRight':
-          e.preventDefault(); e.stopPropagation(); this.ui.nextPage(); return
         case 'ArrowDown':
           e.preventDefault(); e.stopPropagation(); this.ui.next(); return
-        case 'ArrowLeft':
-          e.preventDefault(); e.stopPropagation(); this.ui.prevPage(); return
         case 'ArrowUp':
           e.preventDefault(); e.stopPropagation(); this.ui.prev(); return
         case ' ': case 'Tab':
@@ -950,7 +1062,7 @@ class InlineMathController {
           e.preventDefault(); this._close(); return
       }
     } else if (mode === 'ghost') {
-      if (e.key === 'Tab' || e.key === 'ArrowRight') {
+      if (e.key === 'Tab') {
         e.preventDefault(); e.stopPropagation()
         this._apply(this.ui.current())
       } else if (e.key === 'Escape') {
@@ -968,6 +1080,10 @@ class InlineMathController {
     if (!parsed) { this._close(); return }
 
     const { text, slots } = expandSnippet(command.insert)
+
+    // 先清 UI（含 ghost chip），再改写选区
+    this.ui.hide(this)
+    this.active = false
 
     const sel = window.getSelection()
     const range = document.createRange()
@@ -995,8 +1111,10 @@ class InlineMathController {
       r.collapse(true)
       sel.removeAllRanges()
       sel.addRange(r)
+      // 无槽位命令：输入已完成，光标未动前不再弹窗
+      if (!slots.length) this.suppress = { node: targetNode, offset: at }
     }
-    this._close()
+    this.scriptEl = null
   }
 
   _findFirstTextNode(root) {
