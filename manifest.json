@@ -3,7 +3,7 @@
   "name": "LaTeX 数学输入法",
   "description": "在 $$ 块公式与行内公式中输入 \\缩写 或 \\中文 检索 LaTeX 命令，Tab / 空格补全含 {} 的完整语法。纯本地运行，不访问网络。",
   "author": "local",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "minCoreVersion": "2.10.42",
   "platforms": ["win32", "darwin", "linux"]
 }

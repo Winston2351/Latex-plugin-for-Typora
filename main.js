@@ -755,6 +755,14 @@ class BlockMathController {
     const items = matchCommands(parsed.query)
     if (!items.length) { this._close(); return }
 
+    // 查询恰好等于完整命令且无模板：文本已就位，不弹 UI（与行内行为一致）
+    if (items.length === 1 && parsed.query !== '' &&
+        items[0].name === parsed.query && items[0].insert === '\\' + items[0].name) {
+      this.ui.hide(this)
+      this.active = false
+      return
+    }
+
     const coords = cm.cursorCoords(cur, 'window')
     const font = this._font()
     const onSelect = item => this._apply(item)
@@ -937,6 +945,7 @@ class InlineMathController {
     this.scriptEl = null
     this.startOffset = -1
     this.suppress = null // 无槽位命令刚补全：{node, offset}，光标未动前不再弹窗
+    this.applying = false // _apply 执行中：屏蔽 execCommand 同步重入的 input/selectionchange → refresh
 
     this.composing = false
     this.onInput = e => { if (!e.isComposing) this.refresh() }
@@ -988,6 +997,10 @@ class InlineMathController {
   }
 
   refresh() {
+    // _apply 途中 execCommand 会同步派发 input/selectionchange；
+    // 此时光标/suppress 尚未就位，重入 refresh 会用"刚补全出的命令"重新弹窗，
+    // 必须整体跳过（apply 末尾光标与 suppress 就位后的下一次 selectionchange 才评估）。
+    if (this.applying) return
     const ctx = this._mathContext()
     if (!ctx) { this._close(); return }
     const { script, node, offset } = ctx
@@ -1006,6 +1019,16 @@ class InlineMathController {
     if (!parsed) { this._close(); return }
     const items = matchCommands(parsed.query)
     if (!items.length) { this._close(); return }
+
+    // 查询恰好等于完整命令且该命令无模板（insert 就是 \name）：
+    // 文本已就位、无可补内容，不弹 UI——否则行尾 \alpha 会持续唤起
+    // "应用它自己"的候选框，空格/Tab 被拦截，无法继续输入。
+    if (items.length === 1 && parsed.query !== '' &&
+        items[0].name === parsed.query && items[0].insert === '\\' + items[0].name) {
+      this.ui.hide(this)
+      this.active = false
+      return
+    }
 
     // 光标矩形
     const range = window.getSelection().getRangeAt(0).cloneRange()
@@ -1045,6 +1068,12 @@ class InlineMathController {
   _handleKey(e) {
     // CodeMirror 场景交给 BlockMathController
     if (e.target && e.target.tagName === 'TEXTAREA' && e.target.closest && e.target.closest('.CodeMirror')) return
+    // 行内公式源码内 Tab 无合法用途（Typora 原生会插入 \t 污染 LaTeX 源码）：
+    // UI 关闭且光标在行内公式中时吞掉 Tab
+    if (e.key === 'Tab' && !this.active && !this.ui.mode) {
+      const ictx = this._mathContext()
+      if (ictx) { e.preventDefault(); e.stopPropagation(); return }
+    }
     if (!this.active || !this.ui.mode || this.ui.owner !== this) return
     const mode = this.ui.mode
     // 左右键不拦截：交回浏览器原生移动光标，弹窗随光标处查询自动刷新/关闭。
@@ -1080,46 +1109,84 @@ class InlineMathController {
     if (!parsed) { this._close(); return }
 
     const { text, slots } = expandSnippet(command.insert)
+    const baseCh = parsed.startCh // 查询起点：插入后所有槽位偏移都要加它（绝对偏移）
 
     // 先清 UI（含 ghost chip），再改写选区
     this.ui.hide(this)
     this.active = false
+    this.suppress = null
 
-    const sel = window.getSelection()
-    const range = document.createRange()
-    range.setStart(node, parsed.startCh)
-    range.setEnd(node, offset)
-    sel.removeAllRanges()
-    sel.addRange(range)
-
-    let ok = false
-    try { ok = document.execCommand('insertText', false, text) } catch (e) { ok = false }
-    if (!ok) {
-      range.deleteContents()
-      range.insertNode(document.createTextNode(text))
-    }
-
-    // 光标落入第一个槽（行内不做 Tab 跳槽）
-    let caret = text.length
-    if (slots.length) caret = slots[0][0]
-    const newNode = (node.parentElement && node.parentElement === ctx.script) ? node : null
-    const targetNode = newNode || this._findFirstTextNode(ctx.script)
-    if (targetNode) {
-      const at = Math.min(caret, targetNode.textContent.length)
-      const r = document.createRange()
-      r.setStart(targetNode, at)
-      r.collapse(true)
+    // execCommand('insertText') 会同步派发 input/selectionchange，
+    // 而光标与 suppress 要等插入完成后才能就位；加锁屏蔽这次重入 refresh。
+    this.applying = true
+    try {
+      const sel = window.getSelection()
+      const range = document.createRange()
+      range.setStart(node, parsed.startCh)
+      range.setEnd(node, offset)
       sel.removeAllRanges()
-      sel.addRange(r)
-      // 无槽位命令：输入已完成，光标未动前不再弹窗
-      if (!slots.length) this.suppress = { node: targetNode, offset: at }
+      sel.addRange(range)
+
+      let ok = false
+      try { ok = document.execCommand('insertText', false, text) } catch (e) { ok = false }
+      if (!ok) {
+        range.deleteContents()
+        range.insertNode(document.createTextNode(text))
+      }
+
+      // 光标落入第一个槽（行内不做 Tab 跳槽）；无槽命令落到插入文本末尾。
+      // slots/caret 均为相对插入文本的偏移，定位时必须加 baseCh。
+      const caretRel = slots.length ? slots[0][0] : text.length
+      const caretEndRel = slots.length ? slots[0][1] : text.length
+      const place = this._locateOffset(ctx.script, baseCh + caretRel, baseCh + caretEndRel, node)
+      if (place) {
+        const r = document.createRange()
+        r.setStart(place.startNode, place.startOffset)
+        r.setEnd(place.endNode, place.endOffset)
+        r.collapse(place.startNode === place.endNode && place.startOffset === place.endOffset)
+        const sel2 = window.getSelection()
+        sel2.removeAllRanges()
+        sel2.addRange(r)
+        // 无槽位命令：输入已完成，记录实际落点（绝对），光标未动前不再弹窗
+        if (!slots.length) this.suppress = { node: place.startNode, offset: place.startOffset }
+      }
+    } finally {
+      this.applying = false
     }
     this.scriptEl = null
   }
 
-  _findFirstTextNode(root) {
-    const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT)
-    return w.nextNode()
+  /**
+   * 把"script 内的绝对字符偏移"定位到具体文本节点+局部偏移。
+   * 典型情况（Typora 行内公式为单个文本节点）直接命中原 node；
+   * execCommand 将节点拆分时，按文本节点顺序累加定位。
+   */
+  _locateOffset(script, absStart, absEnd, hintNode) {
+    // 快速路径：hintNode 仍是 script 直接子节点，先算它在文本中的起始偏移
+    if (hintNode && hintNode.parentElement === script) {
+      let base = 0, n = script.firstChild
+      while (n && n !== hintNode) { if (n.nodeType === 3) base += n.textContent.length; n = n.nextSibling }
+      if (n === hintNode) {
+        const len = hintNode.textContent.length
+        if (absStart >= base && absStart <= base + len &&
+            absEnd >= base && absEnd <= base + len) {
+          return { startNode: hintNode, startOffset: absStart - base, endNode: hintNode, endOffset: absEnd - base }
+        }
+      }
+    }
+    const pick = abs => {
+      const ww = document.createTreeWalker(script, NodeFilter.SHOW_TEXT)
+      let a = 0, x
+      while ((x = ww.nextNode())) {
+        const l = x.textContent.length
+        if (abs <= a + l) return { node: x, offset: Math.max(0, abs - a) }
+        a += l
+      }
+      return null
+    }
+    const s = pick(absStart), e = pick(absEnd)
+    if (!s || !e) return null
+    return { startNode: s.node, startOffset: s.offset, endNode: e.node, endOffset: e.offset }
   }
 }
 
