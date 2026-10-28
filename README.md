@@ -65,6 +65,12 @@ Typora 插件——在 `$$` 块公式与行内公式中输入 `\缩写` 或 `\�
 
 （暂未上架，可手动安装）
 
+### Typora 更新后插件失效？
+
+Typora 自动更新会重写安装目录的 `resources\`，抹掉 `window.html` 中的插件加载器注入（插件本体位于 `%APPDATA%\Typora\plugins\`，更新不影响）。
+
+恢复方法：**关闭 Typora → 双击仓库根目录的 `reinstall-plugin.bat` → 重新打开 Typora**。脚本幂等可重复运行，并自动备份 `window.html`（同目录 `window.html.math-input.bak`）。
+
 ## 使用方法
 
 1. 在 Typora 中输入 `$$` 并回车，进入块公式编辑模式
